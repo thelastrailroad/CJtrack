@@ -1,2 +1,2 @@
-python-opensky==0.4.3
+python-opensky==0.2.0
 python-telegram-bot==21.5
