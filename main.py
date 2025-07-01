@@ -1,5 +1,5 @@
 """
-Realtime ZS-CJI flight summary ➜ Telegram using Flightradar24 API
+Realtime ZS-CJI & ZS-TLF flight summaries ➜ Telegram using Flightradar24 API
 
 ENV VARS
   TG_TOKEN   : Your Telegram Bot API token
@@ -24,7 +24,7 @@ POLL_SEC     = int(os.getenv("POLL_SEC", "60"))
 TG_TOKEN     = os.getenv("TG_TOKEN")
 TG_CHAT      = int(os.getenv("TG_CHAT", "0"))
 FR24_TOKEN   = os.getenv("FR24_TOKEN")
-REGISTRATION = "ZS-CJI"
+REGISTRATIONS = ["ZS-CJI", "ZS-TLF"]  # Now tracking ZS-CJI and ZS-TLF
 
 if not (TG_TOKEN and TG_CHAT and FR24_TOKEN):
     raise SystemExit("❌ Set TG_TOKEN, TG_CHAT, and FR24_TOKEN environment variables.")
@@ -39,7 +39,7 @@ logging.basicConfig(
 # --- Telegram Application ----------------------------------------------------
 
 app = ApplicationBuilder().token(TG_TOKEN).build()
-app.bot_data["last_summary"] = None
+app.bot_data["last_summaries"] = {}
 
 # --- Error Handler ------------------------------------------------------------
 
@@ -53,70 +53,77 @@ app.add_error_handler(ignore_conflict)
 
 # --- FlightRadar24 Fetch Logic -----------------------------------------------
 
-async def fetch_summary() -> dict | None:
+async def fetch_summary() -> dict[str, dict | None]:
     now = datetime.now(timezone.utc)
     frm = (now - timedelta(days=1)).strftime("%Y-%m-%dT%H:%M:%S")
     to  = now.strftime("%Y-%m-%dT%H:%M:%S")
-
-    url = "https://fr24api.flightradar24.com/api/flight-summary/light"
     headers = {
         "Authorization": f"Bearer {FR24_TOKEN}",
         "Accept": "application/json",
         "Accept-Version": "v1"
     }
-    params = {
-        "registrations": REGISTRATION,
-        "flight_datetime_from": frm,
-        "flight_datetime_to": to,
-        "limit": 1,
-        "sort": "desc"
-    }
+    results = {}
+    for reg in REGISTRATIONS:
+        params = {
+            "registrations": reg,
+            "flight_datetime_from": frm,
+            "flight_datetime_to": to,
+            "limit": 1,
+            "sort": "desc"
+        }
+        async with aiohttp.ClientSession() as session:
+            async with session.get(
+                "https://fr24api.flightradar24.com/api/flight-summary/light",
+                headers=headers,
+                params=params,
+                timeout=10
+            ) as resp:
+                resp.raise_for_status()
+                data = await resp.json()
+        flights = data.get("data", [])
+        results[reg] = flights[0] if flights else None
+    return results
 
-    async with aiohttp.ClientSession() as session:
-        async with session.get(url, headers=headers, params=params, timeout=10) as resp:
-            resp.raise_for_status()
-            data = await resp.json()
+# --- Message Building --------------------------------------------------------
 
-    flights = data.get("data", [])
-    return flights[0] if flights else None
-
-def build_message(summary: dict) -> tuple[str, InlineKeyboardMarkup]:
-    # Use empty string if field is missing or null
-    flight_no = summary.get("flight") or "N/A"
-    takeoff   = summary.get("datetime_takeoff") or "N/A"
-    landed    = summary.get("datetime_landed") or "N/A"
-    hex_code  = summary.get("hex") or "N/A"
-
-    text = (
-        f"✈️ <b>ZS-CJI Flight Summary</b>\n"
-        f"• Flight No: <code>{flight_no}</code>\n"
-        f"• Take-off : <code>{takeoff}</code>\n"
-        f"• Landed   : <code>{landed}</code>\n"
-        f"• Hex Code : <code>{hex_code}</code>"
-    )
-
-    # Only build URL if flight_no is not "N/A"
-    if flight_no != "N/A":
-        url = f"https://www.flightradar24.com/data/flights/{flight_no.lower()}"
-        kb  = InlineKeyboardMarkup([[InlineKeyboardButton("View on FR24", url=url)]])
-    else:
-        kb = InlineKeyboardMarkup([])
-
+def build_message(summaries: dict[str, dict | None]) -> tuple[str, InlineKeyboardMarkup]:
+    messages = []
+    buttons = []
+    for reg, summary in summaries.items():
+        if summary is None:
+            messages.append(f"✈️ <b>{reg}</b>: No recent data")
+            continue
+        flight_no = summary.get("flight") or "N/A"
+        takeoff   = summary.get("datetime_takeoff") or "N/A"
+        landed    = summary.get("datetime_landed") or "N/A"
+        hex_code  = summary.get("hex") or "N/A"
+        messages.append(
+            f"✈️ <b>{reg} Flight Summary</b>\n"
+            f"• Flight No: <code>{flight_no}</code>\n"
+            f"• Take-off : <code>{takeoff}</code>\n"
+            f"• Landed   : <code>{landed}</code>\n"
+            f"• Hex Code : <code>{hex_code}</code>\n"
+        )
+        if flight_no != "N/A":
+            url = f"https://www.flightradar24.com/data/flights/{flight_no.lower()}"
+            buttons.append([InlineKeyboardButton(f"View {reg} on FR24", url=url)])
+    text = "\n\n".join(messages)
+    kb = InlineKeyboardMarkup(buttons) if buttons else InlineKeyboardMarkup([])
     return text, kb
 
 # --- Job Callback -------------------------------------------------------------
 
 async def polling_job(context: ContextTypes.DEFAULT_TYPE) -> None:
-    summary = await fetch_summary()
-    if summary and summary != context.bot_data["last_summary"]:
-        msg, kb = build_message(summary)
+    summaries = await fetch_summary()
+    if any(summaries.values()) and summaries != context.bot_data.get("last_summaries"):
+        msg, kb = build_message(summaries)
         await context.bot.send_message(
             chat_id=TG_CHAT,
             text=msg,
             reply_markup=kb,
             parse_mode="HTML"
         )
-        context.bot_data["last_summary"] = summary
+        context.bot_data["last_summaries"] = summaries
         logging.info("✅ New summary sent.")
     else:
         logging.info("⏸️ No new summary.")
@@ -124,14 +131,19 @@ async def polling_job(context: ContextTypes.DEFAULT_TYPE) -> None:
 # --- /status Command Handler -------------------------------------------------
 
 async def status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    last = context.bot_data.get("last_summary")
+    last = context.bot_data.get("last_summaries", {})
     if last:
-        takeoff = last.get("datetime_takeoff") or "N/A"
-        landed  = last.get("datetime_landed") or "N/A"
-        text = f"🛰 Last summary:\n• Take-off: {takeoff}\n• Landed: {landed}"
+        text = "🛰 Last summaries:\n\n"
+        for reg, summary in last.items():
+            if summary:
+                takeoff = summary.get("datetime_takeoff") or "N/A"
+                landed  = summary.get("datetime_landed") or "N/A"
+                text += f"• <b>{reg}</b>:\n  - Take-off: {takeoff}\n  - Landed: {landed}\n\n"
+            else:
+                text += f"• <b>{reg}</b>: No summary\n\n"
     else:
-        text = "⚠️ No flight summary fetched yet."
-    await context.bot.send_message(chat_id=update.effective_chat.id, text=text)
+        text = "⚠️ No flight summaries fetched yet."
+    await context.bot.send_message(chat_id=update.effective_chat.id, text=text, parse_mode="HTML")
 
 # --- Application Setup -------------------------------------------------------
 
