@@ -2,8 +2,8 @@
 Realtime ZS-CJI flight summary ➜ Telegram using Flightradar24 API
 
 ENV VARS
-  TG_TOKEN   : Your Telegram BotFather token (e.g., 7704469520:…)
-  TG_CHAT    : Numeric chat ID for your Telegram conversation
+  TG_TOKEN   : Your Telegram BotFather token
+  TG_CHAT    : Numeric chat ID
   FR24_TOKEN : Your Flightradar24 API Bearer token
 OPTIONAL
   POLL_SEC   : Seconds between queries (default 60)
@@ -23,22 +23,27 @@ POLL_SEC     = int(os.getenv("POLL_SEC", "60"))
 TG_TOKEN     = os.getenv("TG_TOKEN")
 TG_CHAT      = int(os.getenv("TG_CHAT", "0"))
 FR24_TOKEN   = os.getenv("FR24_TOKEN")
-REGISTRATION = "ZS-CJI"  # Tail number
+REGISTRATION = "ZS-CJI"
 
 if not (TG_TOKEN and TG_CHAT and FR24_TOKEN):
     raise SystemExit("❌ Set TG_TOKEN, TG_CHAT, and FR24_TOKEN environment variables.")
 
-# Build the Telegram app
-app = ApplicationBuilder().token(TG_TOKEN).build()
+# Build the Telegram application, scheduling on_startup inside its loop
+app = (
+    ApplicationBuilder()
+    .token(TG_TOKEN)
+    .post_init(lambda application: asyncio.create_task(main_loop()))
+    .build()
+)
+
+# Keep last summary in memory
 app.bot_data["last_summary"] = None
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
 
 
 async def fetch_summary() -> dict | None:
-    """
-    Fetch the latest flight summary for REGISTRATION via Flight Summary Light endpoint.
-    """
+    """Fetch the latest flight summary for REGISTRATION."""
     now = datetime.now(timezone.utc)
     frm = (now - timedelta(days=1)).strftime("%Y-%m-%dT%H:%M:%S")
     to  = now.strftime("%Y-%m-%dT%H:%M:%S")
@@ -66,9 +71,7 @@ async def fetch_summary() -> dict | None:
 
 
 def build_message(summary: dict) -> tuple[str, InlineKeyboardMarkup]:
-    """
-    Construct a Telegram message and inline keyboard from a flight summary.
-    """
+    """Construct the Telegram message and inline keyboard."""
     flight_no = summary.get("flight", "N/A")
     takeoff   = summary.get("datetime_takeoff", "N/A")
     landed    = summary.get("datetime_landed", "N/A")
@@ -83,14 +86,12 @@ def build_message(summary: dict) -> tuple[str, InlineKeyboardMarkup]:
     )
 
     url = f"https://www.flightradar24.com/data/flights/{flight_no.lower()}"
-    kb = InlineKeyboardMarkup([[
-        InlineKeyboardButton("View on FR24", url=url)
-    ]])
+    kb = InlineKeyboardMarkup([[InlineKeyboardButton("View on FR24", url=url)]])
     return text, kb
 
 
 async def main_loop():
-    """Background task: poll every POLL_SEC seconds and send new summaries."""
+    """Background task: fetch and send new summaries every POLL_SEC seconds."""
     logging.info("🚀 Starting Flightradar24 polling loop...")
     while True:
         try:
@@ -113,7 +114,7 @@ async def main_loop():
 
 
 async def status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Reply to /status with the last fetched summary details."""
+    """Handle /status — report last fetched summary."""
     last = context.bot_data.get("last_summary")
     if last:
         takeoff = last.get("datetime_takeoff", "N/A")
@@ -127,9 +128,5 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 if __name__ == "__main__":
     # Register the /status command
     app.add_handler(CommandHandler("status", status))
-
-    # Start the background polling task before polling Telegram
-    asyncio.create_task(main_loop())
-
-    # Run the bot (polls Telegram for commands and stays alive)
+    # Start polling Telegram (and keep the application running)
     app.run_polling()
