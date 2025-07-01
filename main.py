@@ -17,8 +17,7 @@ from datetime import datetime, timezone
 
 import async_timeout
 from python_opensky import OpenSky
-from telegram import Bot, InlineKeyboardButton, InlineKeyboardMarkup, Update
-from telegram.constants import ParseMode
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, ParseMode, Update
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 
 # Configuration
@@ -30,11 +29,15 @@ TG_CHAT  = int(os.getenv("TG_CHAT", "0"))
 if not TG_TOKEN or TG_CHAT == 0:
     raise SystemExit("❌ TG_TOKEN and TG_CHAT must be set as environment variables.")
 
-# Initialize Bot & App
-bot = Bot(TG_TOKEN)
-app = ApplicationBuilder().token(TG_TOKEN).build()
+# Initialize Application
+app = (
+    ApplicationBuilder()
+    .token(TG_TOKEN)
+    .post_init(lambda application: asyncio.create_task(on_startup(application)))
+    .build()
+)
 
-# Shared state storage
+# Store startup time and last known state
 app.bot_data["start_time"] = time.time()
 app.bot_data["last_state"] = None
 
@@ -49,7 +52,7 @@ def fmt(v, unit="", mult=1.0, prec=0):
 
 def build_message(state):
     """Build formatted message with aircraft data."""
-    # altitude: prefer geometric, fallback to barometric
+    # Altitude: prefer geometric, fallback to barometric
     alt = fmt(state.geometric_altitude, " m") if state.geometric_altitude else fmt(state.barometric_altitude, " m")
     vel = fmt(state.velocity, " kt", 1.943)
     lat = fmt(state.latitude, "", 1.0, 3)
@@ -71,6 +74,15 @@ def build_message(state):
         InlineKeyboardButton("🛩️ OpenSky Track", url=osky)
     ]])
     return txt, kb
+
+
+async def on_startup(application):
+    """Send startup confirmation and launch the background polling."""
+    await application.bot.send_message(
+        chat_id=TG_CHAT,
+        text="✅ ZS-CJI Tracker Bot is now online and connected to Telegram!"
+    )
+    asyncio.create_task(main_loop())
 
 
 async def status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -96,17 +108,19 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def main_loop():
     """Poll OpenSky for ZS-CJI and send updates to Telegram."""
-    logging.info("🚀 ZS-CJI Tracker Bot starting...")
+    logging.info("🚀 ZS-CJI Tracker Bot starting polling loop...")
     async with OpenSky() as opensky:
         while True:
             try:
                 async with async_timeout.timeout(10):
-                    response = await opensky.get_states(icao24=ICAO24)
-                if response and response.states:
-                    state = response.states[0]
+                    response = await opensky.get_states()
+                # Filter for ZS-CJI
+                states = [s for s in response.states if s.icao24.lower() == ICAO24.lower()] if response.states else []
+                if states:
+                    state = states[0]
                     app.bot_data["last_state"] = state
                     msg, kb = build_message(state)
-                    await bot.send_message(
+                    await app.bot.send_message(
                         chat_id=TG_CHAT,
                         text=msg,
                         reply_markup=kb,
@@ -121,19 +135,7 @@ async def main_loop():
 
 
 if __name__ == "__main__":
-    # Register command handler
+    # Register /status command
     app.add_handler(CommandHandler("status", status))
-
-    async def runner():
-        await app.initialize()
-        # Startup confirmation
-        await bot.send_message(chat_id=TG_CHAT,
-                               text="✅ ZS-CJI Tracker Bot is now online and connected to Telegram!")
-        # Start command listener
-        await app.start()
-        # Start background polling
-        asyncio.create_task(main_loop())
-        # Idle to keep the bot running
-        await app.updater.idle()
-
-    asyncio.run(runner())
+    # Start polling and idle
+    app.run_polling()
