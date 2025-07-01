@@ -1,0 +1,8 @@
+{
+  "build": {
+    "cmd": "pip install -r requirements.txt"
+  },
+  "deploy": {
+    "cmd": "python main.py"
+  }
+}
