@@ -1,24 +1,14 @@
 """
 Realtime tracker for Cessna CitationJet ZS-CJI (ICAO-24 3e5671) ➜ Telegram.
-Runs forever on Railway.
-
-ENV VARS
-  TG_TOKEN : BotFather token for @CJza_bot  
-  TG_CHAT  : Numeric chat ID
-OPTIONAL
-  POLL_SEC : Seconds between queries (default 60)
+Uses direct OpenSky API calls to avoid dependency issues.
 """
 
-import asyncio
-import logging
-import os
-import time
+import asyncio, logging, os
 from datetime import datetime, timezone
+import aiohttp
 
-import async_timeout
-from python_opensky import OpenSky
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, ParseMode, Update
-from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
+from telegram import Bot, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.constants import ParseMode
 
 # Configuration
 ICAO24   = "3e5671"  # ZS-CJI's hex code
@@ -29,35 +19,51 @@ TG_CHAT  = int(os.getenv("TG_CHAT", "0"))
 if not TG_TOKEN or TG_CHAT == 0:
     raise SystemExit("❌ TG_TOKEN and TG_CHAT must be set as environment variables.")
 
-# Initialize Application
-app = (
-    ApplicationBuilder()
-    .token(TG_TOKEN)
-    .post_init(lambda application: asyncio.create_task(on_startup(application)))
-    .build()
-)
-
-# Store startup time and last known state
-app.bot_data["start_time"] = time.time()
-app.bot_data["last_state"] = None
-
-logging.basicConfig(level=logging.INFO,
-                    format="%(asctime)s | %(levelname)s | %(message)s")
-
+# Initialize APIs
+bot = Bot(TG_TOKEN)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
 
 def fmt(v, unit="", mult=1.0, prec=0):
-    """Format numeric values with fallback for None."""
+    """Format values with fallback for None"""
     return f"{v*mult:.{prec}f}{unit}" if v is not None else "--"
 
+async def get_aircraft_data():
+    """Fetch aircraft data directly from OpenSky REST API"""
+    url = f"https://opensky-network.org/api/states/all?icao24={ICAO24}"
+    
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as response:
+                if response.status == 200:
+                    data = await response.json()
+                    if data.get('states') and len(data['states']) > 0:
+                        return data['states'][0]  # First aircraft state
+        return None
+    except Exception as e:
+        logging.error(f"OpenSky API error: {e}")
+        return None
 
-def build_message(state):
-    """Build formatted message with aircraft data."""
-    # Altitude: prefer geometric, fallback to barometric
-    alt = fmt(state.geometric_altitude, " m") if state.geometric_altitude else fmt(state.barometric_altitude, " m")
-    vel = fmt(state.velocity, " kt", 1.943)
-    lat = fmt(state.latitude, "", 1.0, 3)
-    lon = fmt(state.longitude, "", 1.0, 3)
-    head = fmt(state.true_track, "°")
+def build_message(state_data):
+    """Build formatted message with aircraft data from raw API response"""
+    # OpenSky API returns array: [icao24, callsign, origin_country, time_position, 
+    # last_contact, longitude, latitude, baro_altitude, on_ground, velocity, 
+    # true_track, vertical_rate, sensors, geo_altitude, squawk, spi, position_source]
+    
+    if not state_data or len(state_data) < 14:
+        return None, None
+        
+    longitude = state_data[5]
+    latitude = state_data[6]
+    baro_altitude = state_data[7]
+    geo_altitude = state_data[13]
+    velocity = state_data[9]
+    true_track = state_data[10]
+    
+    alt = fmt(geo_altitude, " m") if geo_altitude else fmt(baro_altitude, " m")
+    vel = fmt(velocity, " kt", 1.943)
+    lat = fmt(latitude, "", 1.0, 3)
+    lon = fmt(longitude, "", 1.0, 3)
+    head = fmt(true_track, "°")
     ts = datetime.now(timezone.utc).strftime("%H:%M:%S UTC")
 
     txt = (
@@ -67,6 +73,7 @@ def build_message(state):
         f"🕐 <i>{ts}</i>"
     )
 
+    # Create interactive buttons
     gmap = f"https://maps.google.com/?q={lat},{lon}"
     osky = f"https://opensky-network.org/aircraft-profile?icao24={ICAO24}"
     kb = InlineKeyboardMarkup([[
@@ -75,67 +82,33 @@ def build_message(state):
     ]])
     return txt, kb
 
-
-async def on_startup(application):
-    """Send startup confirmation and launch the background polling."""
-    await application.bot.send_message(
-        chat_id=TG_CHAT,
-        text="✅ ZS-CJI Tracker Bot is now online and connected to Telegram!"
-    )
-    asyncio.create_task(main_loop())
-
-
-async def status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Reply to /status with bot uptime and last known aircraft position."""
-    uptime = time.time() - context.bot_data["start_time"]
-    hrs, rem = divmod(int(uptime), 3600)
-    mins, secs = divmod(rem, 60)
-    last = context.bot_data["last_state"]
-    if last:
-        lat = f"{last.latitude:.3f}"
-        lon = f"{last.longitude:.3f}"
-        alt = f"{last.geometric_altitude:.0f} m" if last.geometric_altitude else "--"
-        loc = f"📍 {lat}, {lon}  🏔️ {alt}"
-    else:
-        loc = "No aircraft data yet."
-    text = (
-        f"🤖 Bot Uptime: {hrs}h {mins}m {secs}s\n"
-        f"🚀 Poll Interval: {POLL_SEC}s\n"
-        f"🔄 Last Update: {loc}"
-    )
-    await context.bot.send_message(chat_id=update.effective_chat.id, text=text)
-
-
 async def main_loop():
-    """Poll OpenSky for ZS-CJI and send updates to Telegram."""
-    logging.info("🚀 ZS-CJI Tracker Bot starting polling loop...")
-    async with OpenSky() as opensky:
-        while True:
-            try:
-                async with async_timeout.timeout(10):
-                    response = await opensky.get_states()
-                # Filter for ZS-CJI
-                states = [s for s in response.states if s.icao24.lower() == ICAO24.lower()] if response.states else []
-                if states:
-                    state = states[0]
-                    app.bot_data["last_state"] = state
-                    msg, kb = build_message(state)
-                    await app.bot.send_message(
+    """Main bot loop - polls OpenSky and sends updates"""
+    logging.info("🚀 ZS-CJI Tracker Bot starting...")
+    
+    while True:
+        try:
+            state_data = await get_aircraft_data()
+            
+            if state_data:
+                msg, kb = build_message(state_data)
+                if msg:
+                    await bot.send_message(
                         chat_id=TG_CHAT,
                         text=msg,
                         reply_markup=kb,
                         parse_mode=ParseMode.HTML
                     )
-                    logging.info("✅ Position update sent.")
+                    logging.info("✅ Position update sent to Telegram")
                 else:
-                    logging.info("⏸️ Aircraft not airborne; no update.")
-            except Exception as e:
-                logging.error(f"❌ Main loop error: {e}")
-            await asyncio.sleep(POLL_SEC)
-
+                    logging.info("⏸️ Invalid aircraft data received")
+            else:
+                logging.info("⏸️ Aircraft not airborne - no update sent")
+                
+        except Exception as e:
+            logging.error(f"❌ Error in main loop: {e}")
+            
+        await asyncio.sleep(POLL_SEC)
 
 if __name__ == "__main__":
-    # Register /status command
-    app.add_handler(CommandHandler("status", status))
-    # Start polling and idle
-    app.run_polling()
+    asyncio.run(main_loop())
