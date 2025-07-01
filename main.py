@@ -81,10 +81,11 @@ async def fetch_summary() -> dict | None:
     return flights[0] if flights else None
 
 def build_message(summary: dict) -> tuple[str, InlineKeyboardMarkup]:
-    flight_no = summary.get("flight", "N/A")
-    takeoff   = summary.get("datetime_takeoff", "N/A")
-    landed    = summary.get("datetime_landed", "N/A")
-    hex_code  = summary.get("hex", "")
+    # Use empty string if field is missing or null
+    flight_no = summary.get("flight") or "N/A"
+    takeoff   = summary.get("datetime_takeoff") or "N/A"
+    landed    = summary.get("datetime_landed") or "N/A"
+    hex_code  = summary.get("hex") or "N/A"
 
     text = (
         f"✈️ <b>ZS-CJI Flight Summary</b>\n"
@@ -93,8 +94,14 @@ def build_message(summary: dict) -> tuple[str, InlineKeyboardMarkup]:
         f"• Landed   : <code>{landed}</code>\n"
         f"• Hex Code : <code>{hex_code}</code>"
     )
-    url = f"https://www.flightradar24.com/data/flights/{flight_no.lower()}"
-    kb  = InlineKeyboardMarkup([[InlineKeyboardButton("View on FR24", url=url)]])
+
+    # Only build URL if flight_no is not "N/A"
+    if flight_no != "N/A":
+        url = f"https://www.flightradar24.com/data/flights/{flight_no.lower()}"
+        kb  = InlineKeyboardMarkup([[InlineKeyboardButton("View on FR24", url=url)]])
+    else:
+        kb = InlineKeyboardMarkup([])
+
     return text, kb
 
 # --- Job Callback -------------------------------------------------------------
@@ -119,8 +126,8 @@ async def polling_job(context: ContextTypes.DEFAULT_TYPE) -> None:
 async def status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     last = context.bot_data.get("last_summary")
     if last:
-        takeoff = last.get("datetime_takeoff", "N/A")
-        landed  = last.get("datetime_landed", "N/A")
+        takeoff = last.get("datetime_takeoff") or "N/A"
+        landed  = last.get("datetime_landed") or "N/A"
         text = f"🛰 Last summary:\n• Take-off: {takeoff}\n• Landed: {landed}"
     else:
         text = "⚠️ No flight summary fetched yet."
@@ -131,7 +138,7 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 # Register /status command
 app.add_handler(CommandHandler("status", status))
 
-# Schedule polling_job every POLL_SEC seconds
+# Schedule polling_job
 job_queue: JobQueue = app.job_queue
 job_queue.run_repeating(polling_job, interval=POLL_SEC, first=0)
 
