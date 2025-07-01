@@ -2,7 +2,7 @@
 Realtime ZS-CJI flight summary ➜ Telegram using Flightradar24 API
 
 ENV VARS
-  TG_TOKEN   : Your Telegram BotFather token
+  TG_TOKEN   : Your Telegram Bot API token
   TG_CHAT    : Numeric chat ID
   FR24_TOKEN : Your Flightradar24 API Bearer token
 OPTIONAL
@@ -11,17 +11,12 @@ OPTIONAL
 
 import logging
 import os
-import asyncio
 from datetime import datetime, timedelta, timezone
 
 import aiohttp
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
-from telegram.ext import (
-    ApplicationBuilder,
-    CommandHandler,
-    ContextTypes,
-    JobQueue,
-)
+from telegram.error import Conflict
+from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes, JobQueue
 
 # --- Configuration ------------------------------------------------------------
 
@@ -44,10 +39,17 @@ logging.basicConfig(
 # --- Telegram Application ----------------------------------------------------
 
 app = ApplicationBuilder().token(TG_TOKEN).build()
-
-# Store last summary to avoid duplicates
 app.bot_data["last_summary"] = None
 
+# --- Error Handler ------------------------------------------------------------
+
+async def ignore_conflict(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if isinstance(context.error, Conflict):
+        logging.warning("🔄 Ignored Conflict error: another getUpdates session is active")
+    else:
+        raise context.error
+
+app.add_error_handler(ignore_conflict)
 
 # --- FlightRadar24 Fetch Logic -----------------------------------------------
 
@@ -78,7 +80,6 @@ async def fetch_summary() -> dict | None:
     flights = data.get("data", [])
     return flights[0] if flights else None
 
-
 def build_message(summary: dict) -> tuple[str, InlineKeyboardMarkup]:
     flight_no = summary.get("flight", "N/A")
     takeoff   = summary.get("datetime_takeoff", "N/A")
@@ -96,13 +97,9 @@ def build_message(summary: dict) -> tuple[str, InlineKeyboardMarkup]:
     kb  = InlineKeyboardMarkup([[InlineKeyboardButton("View on FR24", url=url)]])
     return text, kb
 
-
 # --- Job Callback -------------------------------------------------------------
 
 async def polling_job(context: ContextTypes.DEFAULT_TYPE) -> None:
-    """
-    Runs every POLL_SEC seconds: fetches summary and sends new ones.
-    """
     summary = await fetch_summary()
     if summary and summary != context.bot_data["last_summary"]:
         msg, kb = build_message(summary)
@@ -117,7 +114,6 @@ async def polling_job(context: ContextTypes.DEFAULT_TYPE) -> None:
     else:
         logging.info("⏸️ No new summary.")
 
-
 # --- /status Command Handler -------------------------------------------------
 
 async def status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -130,13 +126,12 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         text = "⚠️ No flight summary fetched yet."
     await context.bot.send_message(chat_id=update.effective_chat.id, text=text)
 
-
 # --- Application Setup -------------------------------------------------------
 
-# Register the /status command
+# Register /status command
 app.add_handler(CommandHandler("status", status))
 
-# Schedule the polling job on startup
+# Schedule polling_job every POLL_SEC seconds
 job_queue: JobQueue = app.job_queue
 job_queue.run_repeating(polling_job, interval=POLL_SEC, first=0)
 
@@ -144,4 +139,4 @@ job_queue.run_repeating(polling_job, interval=POLL_SEC, first=0)
 
 if __name__ == "__main__":
     logging.info("🚀 Starting Telegram bot with FlightRadar24 polling...")
-    app.run_polling()
+    app.run_polling(drop_pending_updates=True)
